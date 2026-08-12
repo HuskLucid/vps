@@ -1,0 +1,93 @@
+name: Telegram Bot (24/7)
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # every 5 hours
+  workflow_dispatch:
+
+env:
+  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # runs for ~6h
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python and dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y python3-pip
+          pip3 install python-telegram-bot==20.7 flask
+
+      - name: Create bot script
+        run: |
+          cat > /home/runner/bot.py <<'BOTEOF'
+          import os, logging, subprocess
+          from telegram import Update
+          from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+          TOKEN = os.environ.get('BOT_TOKEN')
+          CHANNEL_ID = os.environ.get('CHANNEL_ID')
+
+          if not TOKEN or not CHANNEL_ID:
+              raise ValueError("Missing BOT_TOKEN or CHANNEL_ID")
+
+          logging.basicConfig(level=logging.INFO)
+
+          async def start(update, context):
+              await update.message.reply_text("✅ Bot is alive on GitHub Actions!")
+
+          async def handle_doc(update, context):
+              doc = update.message.document
+              file = await doc.get_file()
+              fname = doc.file_name
+              path = f"/tmp/{fname}"
+              await file.download_to_drive(path)
+              subprocess.run(["split", "-b", "1900M", path, f"{path}.part"])
+              for chunk in os.listdir("/tmp"):
+                  if chunk.startswith(f"{fname}.part"):
+                      with open(f"/tmp/{chunk}", "rb") as f:
+                          await context.bot.send_document(chat_id=CHANNEL_ID, document=f, filename=chunk)
+                      os.remove(f"/tmp/{chunk}")
+              os.remove(path)
+              await update.message.reply_text("✅ Uploaded chunks.")
+
+          async def handle_get(update, context):
+              if not context.args:
+                  await update.message.reply_text("Usage: /get <filename>")
+                  return
+              await update.message.reply_text("Go to the storage channel, download .part files, reassemble with: cat *.part.* > file")
+
+          def main():
+              app = ApplicationBuilder().token(TOKEN).build()
+              app.add_handler(CommandHandler("start", start))
+              app.add_handler(CommandHandler("get", handle_get))
+              app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+              app.run_polling()
+
+          if __name__ == "__main__":
+              main()
+          BOTEOF
+
+      - name: Create Flask keep‑alive (optional)
+        run: |
+          cat > /home/runner/app.py <<'FLASKEOF'
+          from flask import Flask
+          app = Flask(__name__)
+          @app.route('/')
+          def home(): return "Bot is running"
+          app.run(host='0.0.0.0', port=8080)
+          FLASKEOF
+          nohup python3 /home/runner/app.py &
+
+      - name: Start the bot
+        run: |
+          nohup python3 /home/runner/bot.py >> /home/runner/bot.log 2>&1 &
+
+      - name: Keep the job alive
+        run: |
+          while true; do sleep 60; done
