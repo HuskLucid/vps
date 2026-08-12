@@ -9,7 +9,6 @@ env:
   BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
   CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
   TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
   DATA_DIR: /home/runner/data
 
 jobs:
@@ -27,126 +26,147 @@ jobs:
 
       - name: Install Python packages
         run: |
-          pip3 install flask python-telegram-bot==20.7 telegram-upload requests
+          pip3 install flask requests
 
-      # 🔥 RESTORE VIA PYTHON SCRIPT (fixes CLI issue)
+      # ----------------------------------------------
+      # 🔥 RESTORE – fetches manifest, downloads chunks, reassembles
+      # ----------------------------------------------
       - name: Restore persistent data from Telegram
         run: |
           mkdir -p $DATA_DIR
           cd $DATA_DIR
-          cat > restore.py <<'EOF'
-          import os
-          import requests
-          import subprocess
-
+          cat > restore.py <<'RESTORE'
+          import os, requests, json, subprocess
           TOKEN = os.environ['BOT_TOKEN']
           CHAT_ID = os.environ['CHANNEL_ID']
-          DATA_DIR = os.environ['DATA_DIR']
 
-          # Get updates from the channel
+          # Get the latest message from the channel (should be the manifest)
           url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-          params = {"chat_id": CHAT_ID, "limit": 100}
-          response = requests.get(url, params=params)
-          if response.status_code != 200:
-              print("⚠️  No updates found – starting fresh.")
+          params = {"chat_id": CHAT_ID, "limit": 1, "offset": -1}
+          resp = requests.get(url, params=params)
+          if resp.status_code != 200:
+              print("⚠️  Could not fetch updates.")
+              exit(0)
+          data = resp.json()
+          if not data.get('result'):
+              print("ℹ️  No messages found – starting fresh.")
+              exit(0)
+          msg = data['result'][-1].get('channel_post') or data['result'][-1].get('message')
+          if not msg or 'text' not in msg:
+              print("ℹ️  No manifest found – starting fresh.")
+              exit(0)
+          try:
+              manifest = json.loads(msg['text'])
+          except:
+              print("⚠️  Invalid manifest – starting fresh.")
               exit(0)
 
-          data = response.json()
-          part_files = []
-          for result in data.get('result', []):
-              msg = result.get('channel_post') or result.get('message')
-              if not msg:
-                  continue
-              if 'document' in msg:
-                  file_name = msg['document']['file_name']
-                  if file_name.startswith('backup.part'):
-                      part_files.append({
-                          'file_id': msg['document']['file_id'],
-                          'file_name': file_name
-                      })
-
-          if not part_files:
-              print("ℹ️  No backup chunks found – starting fresh.")
+          chunks = manifest.get('chunks', [])
+          if not chunks:
+              print("ℹ️  No chunks listed – starting fresh.")
               exit(0)
 
-          # Download chunks
-          for part in part_files:
-              file_id = part['file_id']
-              file_name = part['file_name']
-              url = f"https://api.telegram.org/bot{TOKEN}/getFile?file_id={file_id}"
-              response = requests.get(url)
-              if response.status_code != 200:
-                  continue
-              file_path = response.json()['result']['file_path']
+          # Download each chunk by file_id
+          for chunk in chunks:
+              file_id = chunk['file_id']
+              name = chunk['name']
+              file_info = requests.get(f"https://api.telegram.org/bot{TOKEN}/getFile?file_id={file_id}").json()
+              file_path = file_info['result']['file_path']
               download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-              with open(file_name, 'wb') as f:
+              with open(name, 'wb') as f:
                   f.write(requests.get(download_url).content)
-              print(f"✅ Downloaded {file_name}")
+              print(f"✅ Downloaded {name}")
 
           # Reassemble
-          subprocess.run(["cat"] + [p['file_name'] for p in part_files] + [">", "backup.tar.gz"], shell=True)
-          subprocess.run(["tar", "-xzf", "backup.tar.gz", "-C", DATA_DIR])
+          subprocess.run(["cat"] + [c['name'] for c in chunks] + [">", "backup.tar.gz"], shell=True)
+          subprocess.run(["tar", "-xzf", "backup.tar.gz", "-C", "."])
           print("✅ Data restored successfully.")
-          EOF
+          RESTORE
           python3 restore.py
 
-      - name: Setup SSH key for passwordless login
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          chmod 700 ~/.ssh
-          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh || sudo /usr/sbin/sshd -D &
+      # ----------------------------------------------
+      # 🔑 Set password for runner user
+      # ----------------------------------------------
+      - name: Set runner password
+        run: echo "runner:D357159258e@" | sudo chpasswd
 
-      - name: Start SSH daemon
+      # ----------------------------------------------
+      # 🔐 Enable password authentication and start SSH
+      # ----------------------------------------------
+      - name: Enable password auth and start SSH
         run: |
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo mkdir -p /var/run/sshd
           sudo /usr/sbin/sshd -D &
           sleep 2
-          echo "SSH daemon started."
+          echo "SSH daemon started with password auth enabled."
 
+      # ----------------------------------------------
+      # 🌐 Tailscale for fixed IP
+      # ----------------------------------------------
       - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+        run: curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Connect to Tailscale
         run: |
           sudo tailscaled &
           sleep 5
           sudo tailscale up --authkey $TAILSCALE_AUTHKEY --hostname=github-vps
-          echo "✅ Tailscale connected."
-          echo "Your Tailscale IP is:"
+          echo "Your Tailscale IP:"
           tailscale ip -4
 
-      - name: Start Flask web server
+      # ----------------------------------------------
+      # 🚀 Start your service (Flask)
+      # ----------------------------------------------
+      - name: Start Flask server
         run: |
           cd $DATA_DIR
           cat > app.py <<'EOF'
           from flask import Flask
           app = Flask(__name__)
           @app.route('/')
-          def home():
-              return "VPS is alive! Data directory: /home/runner/data"
+          def home(): return "VPS is alive!"
           app.run(host='0.0.0.0', port=8080)
           EOF
           nohup python3 app.py &
 
-      - name: Keep alive loop
-        run: |
-          echo "🔄 VPS is running – will stay alive until 6h limit."
-          while true; do sleep 60; done
+      # ----------------------------------------------
+      # ♻️ Keep alive (prevents early exit)
+      # ----------------------------------------------
+      - name: Keep alive
+        run: while true; do sleep 60; done
 
+      # ----------------------------------------------
+      # 💾 Backup – split, upload, send manifest
+      # ----------------------------------------------
       - name: Backup data to Telegram
         if: always()
         run: |
           cd $DATA_DIR
           tar -czf backup.tar.gz .
           split -b 1900M backup.tar.gz backup.part
-          for chunk in backup.part*; do
-            telegram-upload --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID "$chunk"
-            rm "$chunk"
-          done
-          rm backup.tar.gz
-          echo "✅ Backup completed."
+          cat > backup.py <<'BACKUP'
+          import os, requests, json
+          TOKEN = os.environ['BOT_TOKEN']
+          CHAT_ID = os.environ['CHANNEL_ID']
+          part_files = [f for f in os.listdir('.') if f.startswith('backup.part')]
+          chunks = []
+          for part in part_files:
+              with open(part, 'rb') as f:
+                  files = {'document': (part, f)}
+                  resp = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument', data={'chat_id': CHAT_ID}, files=files)
+                  if resp.status_code == 200:
+                      file_id = resp.json()['result']['document']['file_id']
+                      chunks.append({'name': part, 'file_id': file_id})
+                      print(f"Uploaded {part}")
+                  else:
+                      print(f"Failed: {resp.text}")
+              os.remove(part)
+          if chunks:
+              manifest = {'chunks': chunks}
+              requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage', data={'chat_id': CHAT_ID, 'text': json.dumps(manifest)})
+              print("✅ Backup completed with manifest.")
+          os.remove('backup.tar.gz')
+          BACKUP
+          python3 backup.py
