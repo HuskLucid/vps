@@ -2,70 +2,66 @@ name: Persistent VPS with Tailscale & Telegram Storage
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # every 5 hours
+    - cron: '0 */5 * * *'
   workflow_dispatch:
 
 env:
   BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
   CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
   TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
   DATA_DIR: /home/runner/data
 
 jobs:
   vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # runs for ~5h50m, safe margin
-
+    timeout-minutes: 350
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ----------------------------------------------
-      # 1. Install base packages
-      # ----------------------------------------------
       - name: Install system dependencies
         run: |
           sudo apt update
           sudo apt install -y python3-pip openssh-server
 
-      # ----------------------------------------------
-      # 2. Install Python packages
-      # ----------------------------------------------
       - name: Install Python packages
         run: |
           pip3 install flask python-telegram-bot==20.7 telegram-upload
 
-      # ----------------------------------------------
-      # 3. Restore data from Telegram
-      # ----------------------------------------------
       - name: Restore persistent data from Telegram
         run: |
           mkdir -p $DATA_DIR
           cd $DATA_DIR
-          # Download all chunks (named backup.part*)
           telegram-download --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID --glob "backup.part*" || echo "No backup found"
           if ls backup.part* 1> /dev/null 2>&1; then
             cat backup.part* > backup.tar.gz
             tar -xzf backup.tar.gz
             rm backup.tar.gz backup.part*
-            echo "✅ Data restored successfully."
+            echo "✅ Data restored."
           else
             echo "ℹ️  No previous backup – starting fresh."
           fi
 
-      # ----------------------------------------------
-      # 4. Install & start SSH server (for Termius)
-      # ----------------------------------------------
+      # 🔑 SSH KEY SETUP
+      - name: Setup SSH key for passwordless login
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PUBLIC_KEY" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+          # Restart SSH (or start if not running)
+          sudo systemctl restart ssh || sudo /usr/sbin/sshd -D &
+
       - name: Start SSH daemon
         run: |
           sudo mkdir -p /var/run/sshd
           sudo /usr/sbin/sshd -D &
           sleep 2
-          echo "SSH daemon started (port 22)."
+          echo "SSH daemon started."
 
-      # ----------------------------------------------
-      # 5. Install Tailscale and connect
-      # ----------------------------------------------
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -79,9 +75,6 @@ jobs:
           echo "Your Tailscale IP is:"
           tailscale ip -4
 
-      # ----------------------------------------------
-      # 6. Start your main service (Flask example)
-      # ----------------------------------------------
       - name: Start Flask web server
         run: |
           cd $DATA_DIR
@@ -95,25 +88,17 @@ jobs:
           EOF
           nohup python3 app.py &
 
-      # ----------------------------------------------
-      # 7. Keep the job alive (prevents early exit)
-      # ----------------------------------------------
       - name: Keep alive loop
         run: |
           echo "🔄 VPS is running – will stay alive until 6h limit."
           while true; do sleep 60; done
 
-      # ----------------------------------------------
-      # 8. Backup data to Telegram (always runs, even on cancel)
-      # ----------------------------------------------
       - name: Backup data to Telegram
         if: always()
         run: |
           cd $DATA_DIR
-          # Archive and split into 1.9 GB chunks
           tar -czf backup.tar.gz .
           split -b 1900M backup.tar.gz backup.part
-          # Upload each chunk
           for chunk in backup.part*; do
             telegram-upload --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID "$chunk"
             rm "$chunk"
