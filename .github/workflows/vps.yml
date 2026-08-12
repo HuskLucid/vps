@@ -29,21 +29,22 @@ jobs:
         run: |
           pip3 install flask python-telegram-bot==20.7 telegram-upload
 
+      # 🔧 FIXED RESTORE STEP – using --bot instead of --bot-token
       - name: Restore persistent data from Telegram
         run: |
           mkdir -p $DATA_DIR
           cd $DATA_DIR
-          telegram-download --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID --glob "backup.part*" || echo "No backup found"
+          # telegram-download uses --bot (not --bot-token)
+          telegram-download --bot $BOT_TOKEN --chat-id $CHANNEL_ID --glob "backup.part*" || echo "No backup found"
           if ls backup.part* 1> /dev/null 2>&1; then
             cat backup.part* > backup.tar.gz
             tar -xzf backup.tar.gz
             rm backup.tar.gz backup.part*
-            echo "✅ Data restored."
+            echo "✅ Data restored successfully."
           else
             echo "ℹ️  No previous backup – starting fresh."
           fi
 
-      # 🔑 SSH KEY SETUP
       - name: Setup SSH key for passwordless login
         run: |
           mkdir -p ~/.ssh
@@ -52,7 +53,6 @@ jobs:
           chmod 700 ~/.ssh
           sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-          # Restart SSH (or start if not running)
           sudo systemctl restart ssh || sudo /usr/sbin/sshd -D &
 
       - name: Start SSH daemon
