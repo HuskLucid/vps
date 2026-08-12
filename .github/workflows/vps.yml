@@ -1,0 +1,71 @@
+name: My VPS
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+env:
+  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+  DATA_DIR: /home/runner/data
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y python3-pip
+          pip3 install flask telegram-upload
+
+      - name: Restore data from Telegram
+        run: |
+          mkdir -p $DATA_DIR
+          cd $DATA_DIR
+          # Download chunks from channel (we assume they're named backup.part*)
+          # Using telegram-download (part of telegram-upload)
+          telegram-download --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID --glob "backup.part*" || echo "No backup found"
+          if ls backup.part* 1> /dev/null 2>&1; then
+            cat backup.part* > backup.tar.gz
+            tar -xzf backup.tar.gz
+            rm backup.tar.gz backup.part*
+            echo "Data restored"
+          else
+            echo "Starting fresh – no backup found"
+          fi
+
+      - name: Start your service (example Flask)
+        run: |
+          cd $DATA_DIR
+          cat > app.py <<'EOF'
+          from flask import Flask
+          app = Flask(__name__)
+          @app.route('/')
+          def home():
+              return "VPS is alive!"
+          app.run(host='0.0.0.0', port=8080)
+          EOF
+          nohup python3 app.py &
+
+      - name: Keep alive (runs your service and prevents exit)
+        run: |
+          while true; do sleep 60; done
+
+      - name: Backup data to Telegram (always runs)
+        if: always()
+        run: |
+          cd $DATA_DIR
+          tar -czf backup.tar.gz .
+          split -b 1900M backup.tar.gz backup.part
+          # Upload chunks
+          for chunk in backup.part*; do
+            telegram-upload --bot-token $BOT_TOKEN --chat-id $CHANNEL_ID "$chunk"
+            rm "$chunk"
+          done
+          rm backup.tar.gz
