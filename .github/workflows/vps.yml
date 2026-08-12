@@ -27,23 +27,68 @@ jobs:
 
       - name: Install Python packages
         run: |
-          pip3 install flask python-telegram-bot==20.7 telegram-upload
+          pip3 install flask python-telegram-bot==20.7 telegram-upload requests
 
-      # 🔧 FIXED RESTORE STEP – using --bot instead of --bot-token
+      # 🔥 RESTORE VIA PYTHON SCRIPT (fixes CLI issue)
       - name: Restore persistent data from Telegram
         run: |
           mkdir -p $DATA_DIR
           cd $DATA_DIR
-          # telegram-download uses --bot (not --bot-token)
-          telegram-download --bot $BOT_TOKEN --chat-id $CHANNEL_ID --glob "backup.part*" || echo "No backup found"
-          if ls backup.part* 1> /dev/null 2>&1; then
-            cat backup.part* > backup.tar.gz
-            tar -xzf backup.tar.gz
-            rm backup.tar.gz backup.part*
-            echo "✅ Data restored successfully."
-          else
-            echo "ℹ️  No previous backup – starting fresh."
-          fi
+          cat > restore.py <<'EOF'
+          import os
+          import requests
+          import subprocess
+
+          TOKEN = os.environ['BOT_TOKEN']
+          CHAT_ID = os.environ['CHANNEL_ID']
+          DATA_DIR = os.environ['DATA_DIR']
+
+          # Get updates from the channel
+          url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+          params = {"chat_id": CHAT_ID, "limit": 100}
+          response = requests.get(url, params=params)
+          if response.status_code != 200:
+              print("⚠️  No updates found – starting fresh.")
+              exit(0)
+
+          data = response.json()
+          part_files = []
+          for result in data.get('result', []):
+              msg = result.get('channel_post') or result.get('message')
+              if not msg:
+                  continue
+              if 'document' in msg:
+                  file_name = msg['document']['file_name']
+                  if file_name.startswith('backup.part'):
+                      part_files.append({
+                          'file_id': msg['document']['file_id'],
+                          'file_name': file_name
+                      })
+
+          if not part_files:
+              print("ℹ️  No backup chunks found – starting fresh.")
+              exit(0)
+
+          # Download chunks
+          for part in part_files:
+              file_id = part['file_id']
+              file_name = part['file_name']
+              url = f"https://api.telegram.org/bot{TOKEN}/getFile?file_id={file_id}"
+              response = requests.get(url)
+              if response.status_code != 200:
+                  continue
+              file_path = response.json()['result']['file_path']
+              download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+              with open(file_name, 'wb') as f:
+                  f.write(requests.get(download_url).content)
+              print(f"✅ Downloaded {file_name}")
+
+          # Reassemble
+          subprocess.run(["cat"] + [p['file_name'] for p in part_files] + [">", "backup.tar.gz"], shell=True)
+          subprocess.run(["tar", "-xzf", "backup.tar.gz", "-C", DATA_DIR])
+          print("✅ Data restored successfully.")
+          EOF
+          python3 restore.py
 
       - name: Setup SSH key for passwordless login
         run: |
